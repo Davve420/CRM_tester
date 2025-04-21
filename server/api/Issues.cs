@@ -5,23 +5,104 @@ using server.Classes;
 using server.Enums;
 using server.Records;
 using server.Services;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+using System.Net.Mail;
+using System.Net;
+using server.Data;
+using MailKit.Net.Smtp;
+using MailKit.Security;
+using MimeKit;
+using SmtpClient = MailKit.Net.Smtp.SmtpClient;
 
 namespace server.api;
 
-public class Issues
+[ApiController]
+[Route("api/[controller]")]
+public class IssuesController : ControllerBase
 {
+    private readonly ApplicationDbContext _context;
+    private readonly IConfiguration _configuration;
     private NpgsqlDataSource Db;
-    public Issues(WebApplication app, NpgsqlDataSource db, string url)
+
+    public IssuesController(ApplicationDbContext context, IConfiguration configuration, NpgsqlDataSource db)
     {
+        _context = context;
+        _configuration = configuration;
         Db = db;
-        url += "/issues";
-        
-        app.MapGet(url, (Delegate)GetIssueByCompany).RoleAuthorization(Role.USER,Role.ADMIN);
-        app.MapGet(url + "/{issueId}", GetIssue).RoleAuthorization(Role.GUEST,Role.USER,Role.ADMIN);
-        app.MapPut(url + "/{issueId}/state", UpdateIssueState).RoleAuthorization(Role.USER,Role.ADMIN);
-        app.MapGet(url + "/{issueId}/messages", GetMessages).RoleAuthorization(Role.GUEST,Role.USER,Role.ADMIN);
-        app.MapPost(url + "/{issueId}/messages", CreateMessage).RoleAuthorization(Role.GUEST,Role.USER,Role.ADMIN);;
-        app.MapPost(url + "/create/{companyName}", CreateIssue);
+    }
+
+    [HttpPost]
+    public async Task<ActionResult<Issue>> CreateIssue([FromBody] IssueRequest request)
+    {
+        if (request == null)
+        {
+            return BadRequest("Ogiltig förfrågan");
+        }
+
+        var issue = new Issue(
+            id: Guid.NewGuid(),
+            companyName: "Default Company", // Detta kan ändras senare
+            customerEmail: request.Email,
+            subject: request.Subject,
+            state: IssueState.NEW,
+            title: request.Title,
+            created: DateTime.UtcNow,
+            latest: DateTime.UtcNow
+        );
+
+        _context.Issues.Add(issue);
+        await _context.SaveChangesAsync();
+
+        try
+        {
+            var smtpSettings = _configuration.GetSection("SmtpSettings");
+            if (smtpSettings == null)
+            {
+                return CreatedAtAction(nameof(GetIssue), new { id = issue.Id }, issue);
+            }
+
+            var message = new MimeMessage();
+            message.From.Add(new MailboxAddress("Support", smtpSettings["FromAddress"]));
+            message.To.Add(new MailboxAddress("", issue.CustomerEmail));
+            message.Subject = $"Nytt ärende: {issue.Title}";
+            message.Body = new TextPart("plain")
+            {
+                Text = $"Ett nytt ärende har skapats:\n\nÄmne: {issue.Subject}\nMeddelande: {request.Message}"
+            };
+
+            using (var client = new SmtpClient())
+            {
+                await client.ConnectAsync(smtpSettings["Host"], int.Parse(smtpSettings["Port"]), SecureSocketOptions.StartTls);
+                await client.AuthenticateAsync(smtpSettings["Username"], smtpSettings["Password"]);
+                await client.SendAsync(message);
+                await client.DisconnectAsync(true);
+            }
+        }
+        catch (Exception ex)
+        {
+            // Logga felet men låt ärendet skapas ändå
+            Console.WriteLine($"Kunde inte skicka e-post: {ex.Message}");
+        }
+
+        return CreatedAtAction(nameof(GetIssue), new { id = issue.Id }, issue);
+    }
+
+    [HttpGet("{id}")]
+    public async Task<ActionResult<Issue>> GetIssue(Guid id)
+    {
+        var issue = await _context.Issues.FindAsync(id);
+        if (issue == null)
+        {
+            return NotFound();
+        }
+        return issue;
+    }
+
+    [HttpGet]
+    public async Task<ActionResult<IEnumerable<Issue>>> GetIssues()
+    {
+        return await _context.Issues.ToListAsync();
     }
 
     private async Task<IResult> GetIssueByCompany(HttpContext context)
@@ -197,74 +278,6 @@ public class Issues
         }
     }
     
-    private async Task<IResult> CreateIssue(string companyName, CreateIssueRequest createIssueRequest, IEmailService email)
-    {
-        await using var cmd = Db.CreateCommand("SELECT * FROM companies WHERE name = @company_name");
-        cmd.Parameters.AddWithValue("@company_name", companyName);
-
-        try
-        {
-            var companyId = await cmd.ExecuteScalarAsync();
-            if (companyId is null)
-            {
-                return Results.NotFound(new { message = "No company found." });
-            }
-        
-            
-            await using var cmd2 = Db.CreateCommand("INSERT INTO issues (company_id, customer_email, title, subject, state, created) VALUES (@company_id, @customer_email, @title, @subject, 'NEW', current_timestamp) RETURNING id;");
-            cmd2.Parameters.AddWithValue("@company_id", companyId);
-            cmd2.Parameters.AddWithValue("@customer_email", createIssueRequest.Email);
-            cmd2.Parameters.AddWithValue("@title", createIssueRequest.Title);
-            cmd2.Parameters.AddWithValue("@subject", createIssueRequest.Subject);
-
-            var issuesId = await cmd2.ExecuteScalarAsync();
-            if (issuesId is not null)
-            {
-                await using var cmd3 = Db.CreateCommand("INSERT INTO messages (issue_id, message, sender, username, time) VALUES (@issue_id, @message, 'CUSTOMER', @username, current_timestamp)");
-                cmd3.Parameters.AddWithValue("@issue_id", issuesId);
-                cmd3.Parameters.AddWithValue("@message", createIssueRequest.Message);
-                cmd3.Parameters.AddWithValue("@username", createIssueRequest.Email);
-                    
-                try
-                {
-                    int rowsAffected = await cmd3.ExecuteNonQueryAsync();
-                    if (rowsAffected == 1)
-                    {
-                        await email.SendEmailAsync(createIssueRequest.Email, 
-                            $"{companyName} - ISSUE: {createIssueRequest.Title}", 
-                            IssueCreatedMessage(companyName, 
-                                createIssueRequest.Message, 
-                                createIssueRequest.Title,
-                                issuesId.ToString()));
-                        return Results.Ok(new { message = "Issue was created successfully." });
-                    }
-                    else
-                    {
-                        return Results.Conflict(new { message = "Query executed but something went wrong." });
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine(ex.Message);
-                    await using var cmd4 = Db.CreateCommand("DELETE FROM issues WHERE id = @issue_id;");
-                    cmd4.Parameters.AddWithValue("@issue_id", issuesId);
-                    await cmd4.ExecuteNonQueryAsync();
-                        
-                    return Results.Conflict(new { message = "Issue was created, but something went wrong during the process, so the issue has been deleted." });
-                }
-            }
-            else
-            {
-                return Results.Json(new { message = "Something went wrong." }, statusCode: 500);   
-            }
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine(ex.Message);
-            return Results.Json(new { message = "Something went wrong." }, statusCode: 500);
-        }
-    }
-
     private async Task<IResult> CreateMessage(Guid issueId, HttpContext context, CreateMessageRequest createMessageRequest)
     {
         var user = JsonSerializer.Deserialize<User>(context.Session.GetString("User"));
@@ -328,4 +341,12 @@ public class Issues
                $"<br> <br> <p>Vänliga hälsningar,</p>" +
                $"<p><strong>{companyName}</strong> kundtjänst.<br>";
     }
+}
+
+public class IssueRequest
+{
+    public string Email { get; set; } = string.Empty;
+    public string Title { get; set; } = string.Empty;
+    public string Subject { get; set; } = string.Empty;
+    public string Message { get; set; } = string.Empty;
 }
